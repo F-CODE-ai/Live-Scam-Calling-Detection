@@ -3,7 +3,6 @@ import json
 from fastapi import FastAPI, APIRouter, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
 from app.config import settings
 from app.conversation.state_machine import sentinel_app
 from app.risk.rule_engine import OTPDetectionAgent
@@ -25,26 +24,44 @@ app.add_middleware(
 # OTP Agent for fast-path check
 otp_agent = OTPDetectionAgent()
 
-# Connection Manager for WebSockets
+
 class ConnectionManager:
+    """
+    Holds a LIST of connections per session_id, not just one.
+    This is what lets live_bridge.py (sending) and the React browser tab
+    (watching) both join the same session_id and both get updates.
+    """
     def __init__(self):
-        self.active_connections: dict[str, WebSocket] = {}
+        self.active_connections: dict[str, list[WebSocket]] = {}
 
     async def connect(self, session_id: str, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections[session_id] = websocket
+        self.active_connections.setdefault(session_id, []).append(websocket)
+        count = len(self.active_connections[session_id])
+        print(f"[CONNECT] session={session_id} now has {count} connection(s)")
 
-    def disconnect(self, session_id: str):
-        if session_id in self.active_connections:
+    def disconnect(self, session_id: str, websocket: WebSocket):
+        conns = self.active_connections.get(session_id, [])
+        if websocket in conns:
+            conns.remove(websocket)
+        if session_id in self.active_connections and not self.active_connections[session_id]:
             del self.active_connections[session_id]
+        print(f"[DISCONNECT] session={session_id}")
 
     async def send_json(self, session_id: str, message: dict):
-        if session_id in self.active_connections:
-            await self.active_connections[session_id].send_text(json.dumps(message))
+        # Send to EVERY connection on this session_id, not just the sender
+        receivers = self.active_connections.get(session_id, [])
+        print(f"[BROADCAST] session={session_id} sending to {len(receivers)} receiver(s) -> risk_score={message.get('risk_score')}")
+        for ws in list(receivers):
+            try:
+                await ws.send_text(json.dumps(message))
+            except Exception as e:
+                print(f"[BROADCAST ERROR] failed to send to one connection: {e}")
+
 
 manager = ConnectionManager()
 
-# WebSocket Route
+
 @app.websocket("/ws/live/{session_id}")
 async def websocket_live_stream(websocket: WebSocket, session_id: str):
     await manager.connect(session_id, websocket)
@@ -52,14 +69,18 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str):
         while True:
             data = await websocket.receive_text()
             payload = json.loads(data)
-            
+
             transcript_text = payload.get("transcript", "")
-            
-            # Fast-path check
+            if not transcript_text:
+                continue
+
+            print(f"[RECEIVED] session={session_id} transcript='{transcript_text}'")
+
+            # Fast-path check (quick OTP-specific alert, <200ms)
             fast_path_result = otp_agent.analyze(transcript_text)
             fast_path_alert = fast_path_result.score >= 0.85
-            
-            # Run LangGraph deep supervisor analysis
+
+            # Run the REAL detection engine through the LangGraph pipeline
             initial_state = {
                 "session_id": session_id,
                 "latest_transcript": transcript_text,
@@ -76,10 +97,9 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str):
                 "recommended_action": "",
                 "next_node": ""
             }
-            
+
             final_state = await sentinel_app.ainvoke(initial_state)
-            
-            # Send real-time response payload back to client React/Electron app
+
             response = {
                 "type": "threat_update",
                 "session_id": session_id,
@@ -91,24 +111,28 @@ async def websocket_live_stream(websocket: WebSocket, session_id: str):
                 "explanation": final_state.get("explanation"),
                 "recommended_action": final_state.get("recommended_action")
             }
-            
-            await manager.send_json(session_id, response)
-            
-    except WebSocketDisconnect:
-        manager.disconnect(session_id)
 
-# Pydantic Schemas for Session Routes
+            # Broadcast to EVERYONE connected on this session (live_bridge.py sent it,
+            # but the browser tab needs to receive it too)
+            await manager.send_json(session_id, response)
+
+    except WebSocketDisconnect:
+        manager.disconnect(session_id, websocket)
+
+
 class StartSessionRequest(BaseModel):
     user_id: str = "default_user"
     device_type: str = "desktop"
+
 
 class StartSessionResponse(BaseModel):
     session_id: str
     status: str
     ws_endpoint: str
 
-# API Router setup
+
 api_router = APIRouter(prefix="/api/v1")
+
 
 @api_router.post("/session/start", response_model=StartSessionResponse, tags=["Session"])
 async def start_session(req: StartSessionRequest):
@@ -119,9 +143,11 @@ async def start_session(req: StartSessionRequest):
         ws_endpoint=f"/ws/live/{session_id}"
     )
 
+
 @api_router.post("/session/{session_id}/end", tags=["Session"])
 async def end_session(session_id: str):
     return {"session_id": session_id, "status": "ended"}
+
 
 @api_router.get("/health", tags=["Health"])
 async def health_check():
@@ -130,5 +156,6 @@ async def health_check():
         "version": "0.1.0",
         "environment": settings.environment
     }
+
 
 app.include_router(api_router)
